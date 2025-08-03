@@ -401,6 +401,15 @@ private:
     void  AddCurve(Geom::Curve const &c);
 
 };
+
+/**
+ * Split a pathvector into its connected components when filled using the given fill rule.
+ *
+ * This problem only has a well-defined answer when the input pathvector is flattened.
+ * Otherwise a sensible answer is returned on a best-effort basis.
+ */
+std::vector<Geom::PathVector> split_non_intersecting_paths(const Geom::PathVector &paths, FillRule fill_rule = FillRule::fill_nonZero);
+
 #endif
 
 /*

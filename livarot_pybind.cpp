@@ -215,4 +215,8 @@ PYBIND11_MODULE(_pylivarot, m) {
 
     m.def("pathv_to_linear_and_cubic_beziers", pathv_to_linear_and_cubic_beziers);    
 
+    m2geom.def("split_non_intersecting_paths", &split_non_intersecting_paths,
+        py::arg("paths"), py::arg("fill_rule") = FillRule::fill_nonZero,
+        "Split a pathvector into its connected components when filled using the given fill rule.");
+
 }

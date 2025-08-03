@@ -75,6 +75,21 @@ struct raster_info {
 };
 typedef void (*RasterInRunFunc) (raster_info &dest,void *data,int nst,float vst,int nen,float ven);	// init for position ph,pv; the last parameter is a pointer
 
+/// Return whether a point is inside a shape, given the point's winding number and the shape's fill rule.
+inline bool is_point_inside(FillRule fill_rule, int winding)
+{
+    switch (fill_rule) {
+        case fill_oddEven:
+            return winding % 2 != 0;
+        default:
+        case fill_nonZero:
+            return winding != 0;
+        case fill_positive:
+            return winding > 0;
+        case fill_justDont:
+            return false;
+    }
+}
 
 enum Side {
     LEFT = 0,

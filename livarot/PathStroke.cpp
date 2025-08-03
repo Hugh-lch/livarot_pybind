@@ -12,7 +12,11 @@
 
 #include "Path.h"
 #include "Shape.h"
+#include "geom.h"
 #include <2geom/transforms.h>
+#include <2geom/pathvector.h>
+#include <2geom/sweeper.h>
+#include <random>
 
 /*
  * stroking polylines into a Shape instance
@@ -749,6 +753,354 @@ void Path::RecRound(Shape *dest, int sNo, int eNo, // start and end index
         lastNo = mNo;
     }
     dest->AddEdge(lastNo, eNo);
+}
+
+namespace Util {
+
+struct TreeifyResult
+{
+    std::vector<int> preorder; ///< The preorder traversal of the nodes, a permutation of {0, ..., N - 1}.
+    std::vector<int> num_children; ///< For each node, the number of direct children.
+};
+
+/**
+ * Given a collection of nodes 0 ... N - 1 and a containment function,
+ * attempt to organise the nodes into a tree (or forest) such that
+ * contains(i, j) is true precisely when i is an ancestor of j.
+ */
+TreeifyResult treeify(int N, std::function<bool(int, int)> const &contains)
+{
+    // Todo: (C++23) Refactor away to a recursive lambda.
+    class Treeifier
+    {
+    public:
+        Treeifier(int N, std::function<bool(int, int)> const &contains)
+            : N{N}
+            , contains{contains}
+            , data(N)
+        {
+            for (int i = 0; i < N; i++) {
+                for (int j = 0; j < N; j++) {
+                    if (j != i && contains(i, j)) {
+                        data[j].num_containers++;
+                        data[i].contained.emplace_back(j);
+                    }
+                }
+            }
+
+            result.num_children.resize(N);
+
+            for (int i = 0; i < N; i++) {
+                if (data[i].num_containers == 0) {
+                    visit(i);
+                }
+            }
+
+            for (int i = 0; i < N; i++) {
+                if (data[i].num_containers != -1) {
+                    std::cerr << "Problem in treeify(): missed node" << std::endl;
+                    result.preorder.emplace_back(i);
+                }
+            }
+
+            assert(result.preorder.size() == N);
+        }
+
+        TreeifyResult moveResult() { return std::move(result); }
+
+    private:
+        // Input
+        int N{};
+        std::function<bool(int, int)> const &contains;
+
+        // State
+        struct Data
+        {
+            int num_containers = 0;
+            std::vector<int> contained;
+        };
+        std::vector<Data> data;
+
+        // Output
+        TreeifyResult result;
+
+        void visit(int i)
+        {
+            result.preorder.emplace_back(i);
+
+            for (auto j : data[i].contained) {
+                data[j].num_containers--;
+            }
+
+            for (auto j : data[i].contained) {
+                if (data[j].num_containers == 0) {
+                    result.num_children[i]++;
+                    visit(j);
+                }
+            }
+
+            data[i].num_containers = -1;
+        }
+    };
+
+    return Treeifier(N, contains).moveResult();
+}
+
+} // namespace Util
+
+
+/*
+* Checks if the path describes a simple rectangle, returning true and populating rect if it does.
+*/
+Geom::OptRect check_simple_rect(Geom::PathVector const &pathv, double precision)
+{
+    // "Simple rectangle" is a single path with 4 line segments.
+    if (pathv.size() != 1) {
+        return {};
+    }
+
+    auto const &path = pathv.front();
+    // might be a better way to check if all the curves are line segments
+    if (!path.closed() || path.size() != 4 ||
+        std::any_of(path.begin(), path.end(), [](auto const &curve) { return !curve.isLineSegment(); }))
+    {
+        return {};
+    }
+
+    auto const p0 = path.initialPoint();
+    auto start = p0;
+    int prev_change = 0;
+    for (auto const &curve : path) {
+        auto end = curve.finalPoint();
+        // define a change in X as 1, change in Y as -1. Both is 0
+        int const change = !Geom::are_near(start.x(), end.x(), precision) - !Geom::are_near(start.y(), end.y(), precision);
+        if (change == 0 || change == prev_change) {
+            // Changing in both x and y, or continuing the same direction as the previous segment.
+            return {};
+        }
+        start = end;
+        prev_change = change;
+    }
+
+    // if we've made it this far, we can assume that the final point of the second segment is the opposite corner
+    auto const p1 = path[1].finalPoint();
+    return Geom::Rect(p0, p1);
+}
+
+/**
+ * Checks whether the filled region defined by pathvector @a a and fill rule @a fill_rule
+ * completely contains pathvector @a b.
+ */
+bool pathv_fully_contains(Geom::PathVector const &a, Geom::PathVector const &b, FillRule fill_rule, double precision = Geom::EPSILON)
+{
+    // Fast-path the case where a is a rectangle.
+    if (auto const a_rect = check_simple_rect(a, precision)) {
+        return a_rect->contains(b.boundsExact());
+    }
+
+    // At minimum, bbox of a must contain bbox of b
+    if (!a.boundsExact()->contains(b.boundsExact())) {
+        return false;
+    }
+
+    // There must be no intersections of edges.
+    // Fixme: This condition is too strict.
+    if (!a.intersect(b, precision).empty()) {
+        return false;
+    }
+
+    // Check winding number of first node of each subpath.
+    // Fixme: This condition is also too strict.
+    for (auto const &path : b) {
+        if (!is_point_inside(fill_rule, a.winding(path.initialPoint()))) {
+            return false;
+        }
+    }
+
+    // BBox is fully contained, no intersections, passed the winding test, the path must be contained
+    return true;
+}
+
+/// Attempts to find a point in the interior of a filled path.
+static std::optional<Geom::Point> find_interior_point(Geom::Path const &path, FillRule fill_rule, std::default_random_engine &gen)
+{
+    auto ran = [&] { return std::uniform_real_distribution()(gen); };
+
+    auto const bounds = path.boundsFast();
+    if (!bounds) {
+        return {};
+    }
+
+    constexpr int max_iterations = 10; // arbitrary cutoff, typically one iteration needed
+    for (int i = 0; i < max_iterations; i++) {
+        // Pick a random horizontal line through the path.
+        auto const y = Geom::lerp(ran(), bounds->top(), bounds->bottom());
+        auto const line = Geom::LineSegment{Geom::Point{bounds->left() - bounds->width(), y}, Geom::Point{bounds->right() + bounds->width(), y}};
+
+        // Intersect the line with the path, recording the intersection times on the line.
+        std::vector<double> times;
+        for (auto const &curve : path) {
+            for (auto const &intersection : line.intersect(curve)) {
+                times.emplace_back(intersection.first);
+            }
+        }
+
+        // Interior-test the points exactly halfway between intersections.
+        for (int j = 1; j < times.size(); j++) {
+            auto const t = (times[j - 1] + times[j]) / 2;
+            auto const p = line.pointAt(t);
+            if (is_point_inside(fill_rule, path.winding(p))) {
+                return p;
+            }
+        }
+    }
+
+    return {};
+}
+
+/**
+ * Given a pathvector @a pathv and fill rule @a fill_rule, compute pathv_fully_contains(pathv[i], pathv[j], fill_rule)
+ * for all possible i != j. This class must be used with the Geom::Sweeper API to actually compute results. The results
+ * are then available by calling contains(i, j);
+ */
+class PathContainmentSweeper
+{
+public:
+    using ItemIterator = Geom::PathVector::const_iterator;
+
+    PathContainmentSweeper(Geom::PathVector const &pathv, FillRule fill_rule, double precision = Geom::EPSILON)
+        : _pathv{pathv}
+        , _fill_rule{fill_rule}
+        , _precision{precision}
+        , _contains(_pathv.size() * _pathv.size(), false) // allocate space for two-dimensional array
+    {}
+
+    Geom::PathVector const &items() const { return _pathv; }
+
+    Geom::Interval itemBounds(ItemIterator path) const
+    {
+        auto const r = path->boundsFast();
+        return r ? (*r)[Geom::X] : Geom::Interval{};
+    }
+
+    void addActiveItem(ItemIterator incoming)
+    {
+        for (auto const &path : _active) {
+            _checkPair(path, incoming);
+            _checkPair(incoming, path);
+        }
+        _active.push_back(incoming);
+    }
+
+    void removeActiveItem(ItemIterator to_remove)
+    {
+        auto const it = std::find(_active.begin(), _active.end(), to_remove);
+        std::swap(*it, _active.back());
+        _active.pop_back();
+    }
+
+    //// Return the value of pathv_fully_contains(pathv[i], pathv[j], fill_rule).
+    bool contains(int i, int j) const { return _contains[index(i, j)]; }
+
+private:
+    Geom::PathVector const &_pathv;
+    FillRule const _fill_rule;
+    double const _precision;
+
+    std::vector<ItemIterator> _active;
+    std::vector<bool> _contains;
+
+    int index(int i, int j) const { return i * _pathv.size() + j; }
+
+    void _checkPair(ItemIterator a, ItemIterator b)
+    {
+        if (pathv_fully_contains(*a, *b, _fill_rule)) {
+            auto const ia = std::distance(_pathv.begin(), a);
+            auto const ib = std::distance(_pathv.begin(), b);
+            _contains[index(ia, ib)] = true;
+        }
+    }
+};
+
+/**
+ * Given a pathvector and a tree structure on its subpaths representing how they are nested,
+ * split the pathvector into its connected components when filled with the given fill rule.
+ */
+class PathContainmentTraverser
+{
+public:
+    PathContainmentTraverser(Geom::PathVector &paths, Util::TreeifyResult const &tree, FillRule fill_rule)
+        : _paths{paths}
+        , _tree{tree}
+        , _fill_rule{fill_rule}
+    {
+        while (_pos < tree.preorder.size()) {
+            _visit(nullptr, 0, nullptr);
+        }
+    }
+
+    std::vector<Geom::PathVector> &&moveResult() { return std::move(_result); }
+
+private:
+    // Input
+    Geom::PathVector &_paths;
+    Util::TreeifyResult const &_tree;
+    FillRule const _fill_rule;
+
+    // State
+    std::default_random_engine _gen{std::random_device()()};
+    int _pos = 0;
+
+    // Output
+    std::vector<Geom::PathVector> _result;
+
+    void _visit(Geom::Path const *parent, int winding, Geom::PathVector *component)
+    {
+        // Visit the next node in the preorder traversal.
+        int const x = _tree.preorder[_pos];
+        _pos++;
+
+        // Determine winding number at paths[x] of its parents in the tree.
+        // Skip the computation for fill_justDont, as it would be unused.
+        if (parent && _fill_rule != fill_justDont) {
+            if (auto const p = find_interior_point(_paths[x], _fill_rule, _gen)) {
+                winding += parent->winding(*p);
+            }
+        }
+
+        // Determine if paths[x] is inside a hole. If so, we start a new component.
+        bool const boundary = !is_point_inside(_fill_rule, winding);
+
+        std::optional<Geom::PathVector> pathv;
+        if (boundary) {
+            pathv.emplace();
+            component = &*pathv;
+        }
+
+        assert(component);
+        component->push_back(std::move(_paths[x]));
+
+        for (int i = 0; i < _tree.num_children[x]; i++) {
+            _visit(&_paths[x], winding, component);
+        }
+
+        if (boundary) {
+            _result.emplace_back(std::move(*pathv));
+        }
+    }
+};
+
+std::vector<Geom::PathVector> split_non_intersecting_paths(const Geom::PathVector &paths, FillRule fill_rule/* = FillRule::fill_nonZero*/)
+{
+    Geom::PathVector paths_copy {paths.begin(), paths.end()};
+    auto path_containment = PathContainmentSweeper{paths_copy, FillRule::fill_nonZero};
+    Geom::Sweeper{path_containment}.process();
+
+    auto const tree = Util::treeify(paths_copy.size(), [&] (int i, int j) {
+        return path_containment.contains(i, j);
+    });
+
+    return PathContainmentTraverser(paths_copy, tree, fill_rule).moveResult();
 }
 
 /*
